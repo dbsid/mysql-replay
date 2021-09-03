@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -467,6 +468,12 @@ func (pw *playWorker) quit(reconnect bool) {
 		}
 	}
 	if pw.conn != nil {
+		pw.conn.Raw(func(driverConn interface{}) error {
+			if dc, ok := driverConn.(io.Closer); ok {
+				dc.Close()
+			}
+			return nil
+		})
 		pw.conn.Close()
 		pw.conn = nil
 		stats.Add(stats.Connections, -1)
