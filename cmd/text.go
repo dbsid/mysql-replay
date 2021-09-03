@@ -32,6 +32,7 @@ func NewTextDumpCommand() *cobra.Command {
 		options        = stream.FactoryOptions{Synchronized: true}
 		output         string
 		reportInterval time.Duration
+		flushInterval  time.Duration
 	)
 	cmd := &cobra.Command{
 		Use:   "dump",
@@ -62,6 +63,7 @@ func NewTextDumpCommand() *cobra.Command {
 			pool := reassembly.NewStreamPool(factory)
 			assembler := reassembly.NewAssembler(pool)
 
+			lastFlushTime := time.Time{}
 			handle := func(name string) error {
 				f, err := pcap.OpenOffline(name)
 				if err != nil {
@@ -70,6 +72,10 @@ func NewTextDumpCommand() *cobra.Command {
 				defer f.Close()
 				src := gopacket.NewPacketSource(f, f.LinkType())
 				for pkt := range src.Packets() {
+					if meta := pkt.Metadata(); meta != nil && meta.Timestamp.Sub(lastFlushTime) > flushInterval {
+						assembler.FlushCloseOlderThan(lastFlushTime)
+						lastFlushTime = meta.Timestamp
+					}
 					layer := pkt.Layer(layers.LayerTypeTCP)
 					if layer == nil {
 						continue
@@ -106,7 +112,6 @@ func NewTextDumpCommand() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				assembler.FlushCloseOlderThan(factory.LastStreamTime().Add(-3 * time.Minute))
 			}
 			assembler.FlushAll()
 
@@ -122,6 +127,7 @@ func NewTextDumpCommand() *cobra.Command {
 	cmd.Flags().StringVarP(&output, "output", "o", "", "output directory")
 	cmd.Flags().BoolVar(&options.ForceStart, "force-start", false, "accept streams even if no SYN have been seen")
 	cmd.Flags().DurationVar(&reportInterval, "report-interval", 5*time.Second, "report interval")
+	cmd.Flags().DurationVar(&flushInterval, "flush-interval", time.Minute, "flush interval")
 
 	return cmd
 }
