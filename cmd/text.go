@@ -32,6 +32,7 @@ func NewTextDumpCommand() *cobra.Command {
 	var (
 		options        = stream.FactoryOptions{Synchronized: true}
 		output         string
+		dataMask       bool
 		reportInterval time.Duration
 		flushInterval  time.Duration
 	)
@@ -59,6 +60,7 @@ func NewTextDumpCommand() *cobra.Command {
 					log:  log,
 					out:  out,
 					w:    bufio.NewWriterSize(out, 1048576),
+					mask: dataMask,
 				}
 			}, options)
 			pool := reassembly.NewStreamPool(factory)
@@ -127,6 +129,7 @@ func NewTextDumpCommand() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&output, "output", "o", "", "output directory")
 	cmd.Flags().BoolVar(&options.ForceStart, "force-start", false, "accept streams even if no SYN have been seen")
+	cmd.Flags().BoolVar(&dataMask, "data-mask", false, "apply data masking before writing")
 	cmd.Flags().DurationVar(&reportInterval, "report-interval", 5*time.Second, "report interval")
 	cmd.Flags().DurationVar(&flushInterval, "flush-interval", time.Minute, "flush interval")
 
@@ -140,12 +143,17 @@ type textDumpHandler struct {
 	out  *os.File
 	w    *bufio.Writer
 
+	mask bool
+
 	fst int64
 	lst int64
 }
 
 func (h *textDumpHandler) OnEvent(e event.MySQLEvent) {
 	var err error
+	if h.mask {
+		e.Mask()
+	}
 	h.buf = h.buf[:0]
 	h.buf, err = event.AppendEvent(h.buf, e)
 	if err != nil {

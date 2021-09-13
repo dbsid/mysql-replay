@@ -1,10 +1,17 @@
 package event
 
 import (
+	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
+
+	"github.com/pingcap/parser"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/format"
+	"github.com/pingcap/parser/test_driver"
 )
 
 const (
@@ -33,6 +40,93 @@ func (event *MySQLEvent) Reset(params []interface{}) *MySQLEvent {
 	event.DB = ""
 	event.Query = ""
 	return event
+}
+
+func (event *MySQLEvent) Mask() {
+	// FIXME: use same algorithm as br-text
+	if event.Type == EventStmtExecute {
+		for i, param := range event.Params {
+			switch v := param.(type) {
+			case int64:
+				event.Params[i] = 0xffffffff &^ v
+			case uint64:
+				event.Params[i] = 0xffffffff &^ v
+			case string:
+				// FIXME: handle types like datetime properly
+				h := sha1.Sum([]byte(v))
+				size := len(v)
+				if size > 40 {
+					size = 40
+				}
+				event.Params[i] = hex.EncodeToString(h[:size])
+			case []byte:
+				h := sha1.Sum(v)
+				size := len(v)
+				if size > 20 {
+					size = 20
+				}
+				event.Params[i] = h[:size]
+			case float32:
+				event.Params[i] = v * math.E
+			case float64:
+				event.Params[i] = v * math.E
+			}
+		}
+	} else if event.Type == EventQuery || event.Type == EventStmtPrepare {
+		nodes, _, err := parser.New().Parse(event.Query, "", "")
+		if err != nil || len(nodes) == 0 {
+			return
+		}
+		node, ok := nodes[0].Accept(literalRewriter{})
+		if !ok {
+			return
+		}
+		buf := new(strings.Builder)
+		err = node.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, buf))
+		if err != nil {
+			return
+		}
+		event.Query = buf.String()
+	}
+}
+
+type literalRewriter struct{}
+
+func (l literalRewriter) Enter(n ast.Node) (node ast.Node, skipChildren bool) {
+	value, ok := n.(*test_driver.ValueExpr)
+	if !ok {
+		return n, false
+	}
+	switch v := value.GetValue().(type) {
+	case int64:
+		value.SetInt64(0xffffffff &^ v)
+	case uint64:
+		value.SetUint64(0xffffffff &^ v)
+	case string:
+		// FIXME: handle types like datetime properly
+		h := sha1.Sum([]byte(v))
+		size := len(v)
+		if size > 40 {
+			size = 40
+		}
+		value.SetString(hex.EncodeToString(h[:size]))
+	case []byte:
+		h := sha1.Sum(v)
+		size := len(v)
+		if size > 20 {
+			size = 20
+		}
+		value.SetBytes(h[:size])
+	case float32:
+		value.SetFloat32(v * math.E)
+	case float64:
+		value.SetFloat64(v * math.E)
+	}
+	return value, false
+}
+
+func (l literalRewriter) Leave(n ast.Node) (node ast.Node, ok bool) {
+	return n, true
 }
 
 func (event *MySQLEvent) String() string {
