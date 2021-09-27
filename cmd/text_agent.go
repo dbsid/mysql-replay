@@ -16,6 +16,7 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/pingcap/errors"
 	"github.com/spf13/cobra"
+	"github.com/zyguan/mysql-replay/stats"
 	"go.uber.org/zap"
 )
 
@@ -156,6 +157,12 @@ func (task *playTask) run() {
 	task.worker.start(context.Background(), r)
 }
 
+type playJobStatus struct {
+	Total    int              `json:"total"`
+	Finished int              `json:"finished"`
+	Stats    map[string]int64 `json:"stats"`
+}
+
 type playTaskStore struct {
 	tasks map[string][]*playTask
 	lock  sync.Mutex
@@ -190,20 +197,18 @@ func (store *playTaskStore) handleTaskSubmission(w http.ResponseWriter, r *http.
 }
 
 func (store *playTaskStore) handleJobStatusQuery(w http.ResponseWriter, r *http.Request) {
-	total, finished := 0, 0
+	var status playJobStatus
 	store.lock.Lock()
-	total = len(store.tasks[r.URL.Path])
+	status.Total = len(store.tasks[r.URL.Path])
 	for _, task := range store.tasks[r.URL.Path] {
 		if atomic.LoadUint32(&task.finished) == 1 {
-			finished += 1
+			status.Finished += 1
 		}
 	}
 	store.lock.Unlock()
+	status.Stats = stats.Dump()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(struct {
-		Total    int `json:"total"`
-		Finished int `json:"finished"`
-	}{total, finished})
+	json.NewEncoder(w).Encode(status)
 }
 
 func NewTextAgentCommand() *cobra.Command {

@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -184,7 +185,7 @@ func NewTextPlayCommand() *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "play",
-		Short: "Play mysql events from text files",
+		Short: "PlayLocal mysql events from text files",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var (
@@ -195,10 +196,6 @@ func NewTextPlayCommand() *cobra.Command {
 			ctl, err = newPlayControl(config, args[0], targetDSN)
 			if err != nil {
 				return err
-			}
-			if len(agents) > 0 {
-				ctl.PlayRemote(context.Background(), agents)
-				return nil
 			}
 
 			fields := make([]zap.Field, 0, 7)
@@ -228,7 +225,7 @@ func NewTextPlayCommand() *cobra.Command {
 				}
 			}()
 
-			ctl.Play(context.Background())
+			ctl.Play(context.Background(), agents)
 			close(done)
 			loadFields()
 			ctl.log.Info("done", fields...)
@@ -321,7 +318,7 @@ func newPlayControl(cfg playConfig, input string, target string) (*playControl, 
 	return ctl, nil
 }
 
-func (pc *playControl) Play(ctx context.Context) {
+func (pc *playControl) PlayLocal(ctx context.Context) {
 	pc.PlayStartTime = time.Now().UnixNano() / int64(time.Millisecond)
 	if len(pc.workers) > 0 {
 		pc.OrigStartTime = pc.workers[0].ts
@@ -347,55 +344,61 @@ func (pc *playControl) Play(ctx context.Context) {
 }
 
 func (pc *playControl) PlayRemote(ctx context.Context, agents []string) {
-	if len(agents) == 0 {
-		pc.log.Error("no agent available")
-		return
-	}
 	pc.PlayStartTime = time.Now().UnixNano() / int64(time.Millisecond)
 	if len(pc.workers) > 0 {
 		pc.OrigStartTime = pc.workers[0].ts
 	}
+	allSubmitted := int32(0)
 	name := fmt.Sprintf("job-%d-%d", pc.PlayStartTime, rand.Int63())
-	for i, worker := range pc.workers {
-		worker.playConfig = pc.playConfig
-		d := worker.WaitTime(worker.ts)
-		if d > 0 {
-			<-time.After(d)
-		}
-		agent := agents[i%len(agents)]
-		task := &playTask{worker: worker}
-		f, err := os.Open(worker.src)
-		if err != nil {
-			pc.log.Error("open session file", zap.Error(err))
-			continue
-		}
-		req, err := task.buildRequest(fmt.Sprintf("%s/%s", agent, name), f)
-		if err != nil {
-			pc.log.Error("build remote request", zap.Error(err))
-			continue
-		}
-		go func() {
-			logger := pc.log.With(zap.String("src", f.Name()), zap.String("url", req.URL.String()))
-			logger.Info("submit task")
-			resp, err := http.DefaultClient.Do(req)
+
+	go func() {
+		defer atomic.StoreInt32(&allSubmitted, 1)
+		for i, worker := range pc.workers {
+			worker.playConfig = pc.playConfig
+			d := worker.WaitTime(worker.ts)
+			if d > 0 {
+				<-time.After(d)
+			}
+			agent := agents[i%len(agents)]
+			task := &playTask{worker: worker}
+			f, err := os.Open(worker.src)
 			if err != nil {
-				logger.Error("send remote request", zap.Error(err))
-				return
+				pc.log.Error("open session file", zap.Error(err))
+				continue
 			}
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				fields := []zap.Field{zap.Int("status", resp.StatusCode)}
-				if msg, err := ioutil.ReadAll(resp.Body); err == nil {
-					fields = append(fields, zap.String("body", string(msg)))
+			req, err := task.buildRequest(fmt.Sprintf("%s/%s", agent, name), f)
+			if err != nil {
+				pc.log.Error("build remote request", zap.Error(err))
+				continue
+			}
+			go func() {
+				logger := pc.log.With(zap.String("src", f.Name()), zap.String("url", req.URL.String()))
+				logger.Info("submit task")
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					logger.Error("send remote request", zap.Error(err))
+					return
 				}
-				logger.Error("unexpected response", fields...)
-			}
-		}()
-	}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					fields := []zap.Field{zap.Int("status", resp.StatusCode)}
+					if msg, err := ioutil.ReadAll(resp.Body); err == nil {
+						fields = append(fields, zap.String("body", string(msg)))
+					}
+					logger.Error("unexpected response", fields...)
+				}
+			}()
+		}
+	}()
+
 	ticker := time.NewTicker(5 * time.Second)
 	for {
 		<-ticker.C
-		total, finished := 0, 0
+		var (
+			total    = 0
+			finished = 0
+			counters = map[string]int64{}
+		)
 		for _, agent := range agents {
 			resp, err := http.Get(fmt.Sprintf("%s/%s", agent, name))
 			if err != nil {
@@ -410,10 +413,7 @@ func (pc *playControl) PlayRemote(ctx context.Context, agents []string) {
 				pc.log.Error("unexpected response", fields...)
 				continue
 			}
-			var status struct {
-				Total    int `json:"total"`
-				Finished int `json:"finished"`
-			}
+			var status playJobStatus
 			err = json.NewDecoder(resp.Body).Decode(&status)
 			if err != nil {
 				pc.log.Error("decode response", zap.String("agent", agent), zap.Error(err))
@@ -421,14 +421,36 @@ func (pc *playControl) PlayRemote(ctx context.Context, agents []string) {
 			}
 			total += status.Total
 			finished += status.Finished
+			for _, name := range []string{
+				stats.Connections, stats.ConnRunning, stats.ConnWaiting,
+				stats.Queries, stats.StmtExecutes, stats.StmtPrepares,
+				stats.FailedQueries, stats.FailedStmtExecutes, stats.FailedStmtPrepares,
+			} {
+				counters[name] += status.Stats[name]
+			}
 		}
-		pc.log.Info("progress", zap.Int("total", total), zap.Int("finished", finished))
-		if total == finished {
+		for _, name := range []string{
+			stats.Connections, stats.ConnRunning, stats.ConnWaiting,
+			stats.Queries, stats.StmtExecutes, stats.StmtPrepares,
+			stats.FailedQueries, stats.FailedStmtExecutes, stats.FailedStmtPrepares,
+		} {
+			stats.Add(name, counters[name]-stats.Get(name))
+		}
+		if atomic.LoadInt32(&allSubmitted) > 0 && total == finished {
 			break
 		}
+		//pc.log.Info("progress", zap.Int("total", total), zap.Int("finished", finished))
 	}
 	ticker.Stop()
 	return
+}
+
+func (pc *playControl) Play(ctx context.Context, agents []string) {
+	if len(agents) == 0 {
+		pc.PlayLocal(ctx)
+	} else {
+		pc.PlayRemote(ctx, agents)
+	}
 }
 
 type statement struct {
