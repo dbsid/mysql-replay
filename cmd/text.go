@@ -34,10 +34,11 @@ import (
 
 func NewTextDumpCommand() *cobra.Command {
 	var (
-		options        = stream.FactoryOptions{Synchronized: true}
-		output         string
-		reportInterval time.Duration
-		flushInterval  time.Duration
+		options            = stream.FactoryOptions{Synchronized: true}
+		output             string
+		reportInterval     time.Duration
+		flushInterval      time.Duration
+		processConcurrency int
 	)
 	cmd := &cobra.Command{
 		Use:   "dump",
@@ -111,12 +112,15 @@ func NewTextDumpCommand() *cobra.Command {
 				}
 			}()
 
+			c := make(chan string, processConcurrency)
 			for _, in := range args {
+				c <- in
 				zap.L().Info("processing " + in)
 				err := handle(in)
 				if err != nil {
 					return err
 				}
+				<-c
 			}
 			assembler.FlushAll()
 
@@ -133,6 +137,7 @@ func NewTextDumpCommand() *cobra.Command {
 	cmd.Flags().BoolVar(&options.ForceStart, "force-start", false, "accept streams even if no SYN have been seen")
 	cmd.Flags().DurationVar(&reportInterval, "report-interval", 5*time.Second, "report interval")
 	cmd.Flags().DurationVar(&flushInterval, "flush-interval", time.Minute, "flush interval")
+	cmd.Flags().IntVar(&processConcurrency, "process-concurrency", 8, "pcap file process concurrency")
 
 	return cmd
 }
